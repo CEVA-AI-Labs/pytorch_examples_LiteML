@@ -6,6 +6,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
+torch.manual_seed(42)
+#code0
+from  liteml.retrainer import RetrainerModel,RetrainerConfig, calibaration_split
 
 
 class Net(nn.Module):
@@ -17,20 +20,27 @@ class Net(nn.Module):
         self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(9216, 128)
         self.fc2 = nn.Linear(128, 10)
+        self.relu1 = nn.ReLU()
+        self.relu2 = nn.ReLU()
+        self.relu3 = nn.ReLU()
+        self.max_pool = nn.MaxPool2d(kernel_size=2)
+        self.log_softmax = nn.LogSoftmax(dim=1)
 
     def forward(self, x):
         x = self.conv1(x)
-        x = F.relu(x)
+        x = self.relu1(x)
         x = self.conv2(x)
-        x = F.relu(x)
-        x = F.max_pool2d(x, 2)
-        x = self.dropout1(x)
+        x = self.relu2(x)
+        x = self.max_pool(x)
+        if self.training:
+            x = self.dropout1(x)
         x = torch.flatten(x, 1)
         x = self.fc1(x)
-        x = F.relu(x)
-        x = self.dropout2(x)
+        x = self.relu3(x)
+        if self.training:
+            x = self.dropout2(x)
         x = self.fc2(x)
-        output = F.log_softmax(x, dim=1)
+        output = self.log_softmax(x)
         return output
 
 
@@ -40,7 +50,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
-        loss = F.nll_loss(output, target)
+        loss = F.cross_entropy(output, target)
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
@@ -65,7 +75,7 @@ def test(model, device, test_loader):
 
     test_loss /= len(test_loader.dataset)
 
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
 
@@ -125,10 +135,35 @@ def main():
                        transform=transform)
     dataset2 = datasets.MNIST('../data', train=False,
                        transform=transform)
-    train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
-    test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
+    # code1
+    dataset1, dataset1_calibration = calibaration_split(dataset1, 0.1)
+    calibration_loader = torch.utils.data.DataLoader(dataset1_calibration, **train_kwargs)
 
+    train_loader = torch.utils.data.DataLoader(dataset1, **train_kwargs)
+    test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
     model = Net().to(device)
+    model.load_state_dict(torch.load('mnist_cnn.pt'))
+    print("Original accuracy: ")
+    test(model, device, test_loader=test_loader)
+
+    # code2
+    rtrnrCfg = RetrainerConfig("./demo_config.yaml", train_loader=train_loader, criterion=F.cross_entropy)
+    rtrnrCfg['QAT']['calibration_loader'] = calibration_loader
+    rtrnrCfg['QAT']['calibration_loader_key'] = lambda model, x: model(x[0].cuda())
+    model = RetrainerModel(model, config=rtrnrCfg).cuda()
+    model.initialize_quantizers(calibration_loader, key = lambda model, x: model(x[0].cuda()))
+    model = model.cuda()
+
+    print("Post training quantization accuracy: ")
+    test(model, device, test_loader)
+
+    # #code3
+    # ptq = True
+    # if ptq:
+    #     model.export_to_onnx(torch.randn((1, 1, 28, 28)), 'ptq_demo_test.onnx', verbose=False, with_json=False)
+    #     return
+
+
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
@@ -136,6 +171,10 @@ def main():
         train(args, model, device, train_loader, optimizer, epoch)
         test(model, device, test_loader)
         scheduler.step()
+
+    # code4
+    model.export_to_onnx(torch.randn((1, 1, 28, 28)), 'qat_demo_test.onnx', verbose=False, with_json=False)
+
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
